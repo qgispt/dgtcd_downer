@@ -20,6 +20,7 @@ from urllib3 import PoolManager
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
     QgsProcessing,
+    QgsProcessingException,
     QgsProcessingAlgorithm,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFeatureSource,
@@ -28,7 +29,6 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterEnum,
     QgsProcessingParameterBoolean,
-    QgsProcessingException,
     QgsMessageLog,
     Qgis,
     QgsCoordinateReferenceSystem,
@@ -38,9 +38,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsFeature,
     QgsGeometry,
-    QgsPoint,
     QgsPointXY,
-    QgsWkbTypes,
     QgsFields,
     QgsField,
     QgsProcessingParameterVectorDestination,
@@ -378,6 +376,47 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 type=QgsProcessing.TypeVectorPolygon,
                 optional=True,
                 createByDefault=True
+            )
+        )
+        # Individual product checkboxes (default True)
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+            'DOWNLOAD_LAZ',
+            self.tr('Download LAZ (point cloud)'),
+            defaultValue=True,
+            optional=True
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+            'DOWNLOAD_MDS_2M',
+            self.tr('Download MDS-2m (raster)'),
+            defaultValue=True,
+            optional=True
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+            'DOWNLOAD_MDS_50CM',
+            self.tr('Download MDS-50cm (raster)'),
+            defaultValue=True,
+            optional=True
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+            'DOWNLOAD_MDT_2M',
+            self.tr('Download MDT-2m (raster)'),
+            defaultValue=True,
+            optional=True
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+            'DOWNLOAD_MDT_50CM',
+            self.tr('Download MDT-50cm (raster)'),
+            defaultValue=True,
+            optional=True
             )
         )
     
@@ -1162,6 +1201,19 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             
             # Get collections to download
             available_collections = ['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
+            # Remove any collections that were not checked in the individual product checkboxes
+            checkbox_map = {
+                'LAZ': 'DOWNLOAD_LAZ',
+                'MDS-2m': 'DOWNLOAD_MDS_2M',
+                'MDS-50cm': 'DOWNLOAD_MDS_50CM',
+                'MDT-2m': 'DOWNLOAD_MDT_2M',
+                'MDT-50cm': 'DOWNLOAD_MDT_50CM'
+            }
+            available_collections = [
+                c for c in available_collections
+                if self.parameterAsBool(parameters, checkbox_map[c], context)
+            ]
+
             if collection_indices:
                 collections = [available_collections[i] for i in collection_indices]
             else:

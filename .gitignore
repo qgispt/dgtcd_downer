@@ -1,0 +1,6 @@
+__pycache__
+.vscode
+.vscode-extensions
+.venv
+.env
+core
