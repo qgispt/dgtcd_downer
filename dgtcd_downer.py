@@ -270,7 +270,9 @@ def download_file(stac_url, url, item_id, extension, output_dir, delay=5.0):
 def get_available_collections_fallback(stac_url):
     print("A obter as coleções via a API do STAC...")
     payload = {
-        "bbox": [-9.5, 36.5, -6.0, 42.5],  # Portugal mainland
+        #for some reason the first 1000 features for portugal only report 2 collections... changed to smaller bbox with all collections
+        #"bbox": [-9.5, 36.5, -6.0, 42.5],  # Portugal mainland
+        "bbox":  [-8.694649,39.430359,-8.693619,39.433011],
         "limit": 1000
     }
     try:
@@ -397,3 +399,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
         sys.exit(1)
+
