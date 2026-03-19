@@ -1,6 +1,6 @@
 [general]
 name=DGT CDD Downloader
-qgisMinimumVersion=3.22
+
 description=Download geospatial data from the DGT (Direção-Geral do Território) CDD Portal.
 about= <div style="max-width:33em">A plugin for the <a href="https://cdd.dgterritorio.gov.pt/">DGT CDD Portal</a>
 
@@ -16,7 +16,10 @@ about= <div style="max-width:33em">A plugin for the <a href="https://cdd.dgterri
 
         Tool developed by the community and not affiliated with Direção-Geral do Território!</li></ul></div>
 
-version=0.1
+version=0.2
+qgisMinimumVersion=3.24
+qgisMaximumVersion=4.99
+supportsQt6=True
 author=Duarte Carreira, Hugo Santos, Pedro Venâncio
 email=qgis@qgis.pt
 tags=dgt,portugal,download,lidar,raster,cdd,processing,mdt,mds
