@@ -31,14 +31,14 @@ class DgtCddDownloaderPlugin:
             self.iface.messageBar().pushMessage(
                 "Warning",
                 "DGT CDD Downloader plugin requires the 'requests' library. Please install it.",
-                level=Qgis.Critical,
+                level=Qgis.MessageLevel.Critical,
                 duration=15
             )
             QgsMessageLog.logMessage(
                 "DGT CDD Downloader: Could not import 'requests'. The plugin will be disabled. "
                 "Please install it in your QGIS Python environment (e.g., 'py3-pip install requests' in OSGeo4W Shell).",
                 'DGT CDD Downloader',
-                level=Qgis.Critical
+                level=Qgis.MessageLevel.Critical
             )
             return
 
