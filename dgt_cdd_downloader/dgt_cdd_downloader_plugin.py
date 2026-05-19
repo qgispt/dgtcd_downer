@@ -5,10 +5,11 @@ from .dgt_cdd_downloader_provider import DgtCddDownloaderProvider
 
 # Check for dependencies
 try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
+    import importlib.util
+    REQUESTS_AVAILABLE = importlib.util.find_spec('requests') is not None
+except Exception:
     REQUESTS_AVAILABLE = False
+
 
 class DgtCddDownloaderPlugin:
     """QGIS Plugin Implementation."""

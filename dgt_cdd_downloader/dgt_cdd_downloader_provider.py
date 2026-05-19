@@ -5,6 +5,7 @@ import os
 # Import the algorithm
 from .processing_algorithm import DgtCddDownloaderAlgorithm
 
+
 class DgtCddDownloaderProvider(QgsProcessingProvider):
     """
     This class registers the DGT CDD Downloader algorithm with the Processing framework.
