@@ -16,10 +16,9 @@ about= <div style="max-width:33em">A plugin for the <a href="https://cdd.dgterri
 
         Tool developed by the community and not affiliated with Direção-Geral do Território!</li></ul></div>
 
-version=0.2
+version=0.2.1
 qgisMinimumVersion=3.24
 qgisMaximumVersion=4.99
-supportsQt6=True
 author=Duarte Carreira, Hugo Santos, Pedro Venâncio
 email=qgis@qgis.pt
 tags=dgt,portugal,download,lidar,raster,cdd,processing,mdt,mds
@@ -30,7 +29,7 @@ icon=icon.png
 experimental=false
 deprecated=false
 changelog=
-    0.2
+    0.2.1
     QGIS 4 compatible (Qt6 support)
     0.1
     First release
