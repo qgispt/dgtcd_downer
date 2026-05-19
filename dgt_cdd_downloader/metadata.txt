@@ -29,3 +29,8 @@ repository=https://github.com/qgispt/dgtcd_downer
 icon=icon.png
 experimental=false
 deprecated=false
+changelog=
+    0.2
+    QGIS 4 compatible (Qt6 support)
+    0.1
+    First release
