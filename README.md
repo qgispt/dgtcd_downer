@@ -19,7 +19,7 @@ Inicialmente foi criado um script permite a descarga "automática" para áreas m
 > Ferramenta desenvolvida pela comunidade e não afiliada com a Direção-Geral do Território.
 
 ### Créditos
-À [DGT](https://www.dgterritorio.gov.pt/) o nosso agradecimento pela iniciativa de disponibilizar todos os dados do levantamento LIDAR para o território nacional continental, de forma livre e gratuita. Uma iniciativa com um alcance enorme no exercício de cidadania no nosso País.
+À [DGT](https://www.dgterritorio.gov.pt/) o nosso agradecimento pela iniciativa de disponibilizar todos os dados do levantamento LIDAR e ortofotos para o território nacional continental, de forma livre e gratuita. Uma iniciativa com um alcance enorme no exercício de cidadania no nosso País.
 
 ## Instalação / Uso
 
@@ -127,7 +127,7 @@ Initially, a script was created to allow "automatic" downloading for larger area
 > Tool developed by the community and not affiliated with the Direção-Geral do Território.
 
 ## Credits
-We would like to thank the DGT for the initiative to make all the LIDAR survey data for the national mainland available, free of charge. This initiative has a huge impact on the exercise of citizenship in our country.
+We would like to thank the DGT for the initiative to make all the LIDAR and orthophotos survey data for the national mainland available, free of charge. This initiative has a huge impact on the exercise of citizenship in our country.
 
 
 ## Install / Usage
