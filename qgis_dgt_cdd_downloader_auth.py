@@ -162,7 +162,10 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
         self.session.headers.update(self.headers)
         
         # Collections that are rasters (not LiDAR point clouds)
-        self.raster_collections = ['MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
+        self.raster_collections = ['MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm',
+                                   'ORTOS-2025', 'ORTOS-2021', 'ORTOS-2018', 'ORTOS-2015',
+                                   'ORTOS-2012', 'ORTOS-2010', 'ORTOS-2007', 'ORTOS-2004',
+                                   'ORTOS-1995']
         
         # Session management
         self.session_timeout = 25 * 60  # 25 minutes in seconds
@@ -195,7 +198,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     
     def shortHelpString(self):
         return self.tr("""
-        Download geospatial LiDAR data from portuguese DGT (Direção-Geral do Território) - CDD Portal.
+        Download geospatial LiDAR and orthophotos data from portuguese DGT (Direção-Geral do Território) - CDD Portal.
         (https://cdd.dgterritorio.gov.pt)
         
         This tool allows you to:
@@ -204,7 +207,8 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
           * A bounding box extent (from map canvas or manual entry)
           * A polygon layer (first feature or selected feature will be used)
         - Download various geospatial LiDAR datasets from DGT CDD Portal
-        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m)
+        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m) and orthophotos
+        (ORTOS-1995, ORTOS-2004, ORTOS-2007, ORTOS-2010, ORTOS-2012, ORTOS-2015, ORTOS-2018, ORTOS-2021, ORTOS-2025)
         - Automatically organize files by collection
         - Create VRT (Virtual Raster) files for raster collections
         - Load VRT files automatically into QGIS
@@ -218,7 +222,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
         
         -------------------------------------------------
         
-        Serviço de descarregamento de dados geográficos LiDAR da DGT (Direção-Geral do Território) - Centro de Dados.
+        Serviço de descarregamento de dados geográficos LiDAR e ortofotos da DGT (Direção-Geral do Território) - Centro de Dados.
         (https://cdd.dgterritorio.gov.pt)
         
         Esta ferramenta permite:
@@ -227,7 +231,8 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
           * Uma extensão retangular (obtida a partir do mapa ou introduzindo as coordenadas manualmente)
           * Uma camada de polígonos (será usado o primeiro polígono da camada ou o polígono selecionado)
         - Descarregar as várias coleções de dados LiDAR disponíveis no Centro de Dados da DGT
-        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m)
+        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m) e ortofotos
+        (ORTOS-1995, ORTOS-2004, ORTOS-2007, ORTOS-2010, ORTOS-2012, ORTOS-2015, ORTOS-2018, ORTOS-2021, ORTOS-2025)
         - Organizar os ficheiros descarregados por coleção
         - Criar ficheiros VRT (Virtual Raster) para as coleções de rasters
         - Carregar automaticamente os VRT no QGIS
@@ -319,7 +324,10 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterEnum(
                 self.COLLECTIONS,
                 self.tr('Collections to download'),
-                options=['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm'],
+                options=['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm',
+                         'ORTOS-2025', 'ORTOS-2021', 'ORTOS-2018', 'ORTOS-2015',
+                         'ORTOS-2012', 'ORTOS-2010', 'ORTOS-2007', 'ORTOS-2004',
+                         'ORTOS-1995'],
                 allowMultiple=True,
                 optional=True
             )
@@ -520,6 +528,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
         """Get file extension based on MIME type"""
         mime_to_extension = {
             "image/tiff; application=geotiff": ".tif",
+            "image/tiff; application=geotiff; profile=cloud-optimized": ".tif",
             "image/tiff": ".tif",
             "application/vnd.laszip": ".laz",
             "application/octet-stream": ".bin",
@@ -849,6 +858,36 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             feedback.reportError(f"Error creating VRT for {collection}: {str(e)}")
             return None
     
+    def rasters_have_overviews(self, collection_dir: str, feedback: QgsProcessingFeedback) -> bool:
+        """Check if the raster files in a collection already contain pyramids (overviews)"""
+        try:
+            from osgeo import gdal
+        except ImportError:
+            return False
+
+        raster_patterns = ['*.tif', '*.tiff', '*.TIF', '*.TIFF']
+        raster_files = []
+        for pattern in raster_patterns:
+            raster_files.extend(glob.glob(os.path.join(collection_dir, pattern)))
+
+        if not raster_files:
+            return False
+
+        for raster_file in raster_files:
+            try:
+                ds = gdal.Open(raster_file, gdal.GA_ReadOnly)
+                if ds is None:
+                    return False
+                has_overviews = ds.GetRasterBand(1).GetOverviewCount() > 0
+                ds = None
+                if not has_overviews:
+                    return False
+            except Exception:
+                return False
+
+        feedback.pushInfo(f"All {len(raster_files)} raster files already contain pyramids (overviews)")
+        return True
+
     def build_vrt_overviews(self, vrt_path: str, feedback: QgsProcessingFeedback) -> bool:
         """Build overviews (pyramids) for a VRT file"""
         try:
@@ -873,11 +912,16 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 feedback=feedback
             )
             
-            if result:
+            ovr_path = vrt_path + ".ovr"
+            if result and os.path.exists(ovr_path):
                 feedback.pushInfo(f"Successfully built overviews for {os.path.basename(vrt_path)}")
                 return True
             else:
-                feedback.reportError(f"Failed to build overviews for {os.path.basename(vrt_path)}")
+                feedback.reportError(
+                    f"Failed to build overviews for {os.path.basename(vrt_path)} "
+                    f"(external overview file not created: {ovr_path}). "
+                    "Check available disk space."
+                )
                 return False
                 
         except Exception as e:
@@ -1169,7 +1213,10 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException("Authentication failed")
             
             # Get collections to download
-            available_collections = ['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
+            available_collections = ['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm',
+                                     'ORTOS-2025', 'ORTOS-2021', 'ORTOS-2018', 'ORTOS-2015',
+                                     'ORTOS-2012', 'ORTOS-2010', 'ORTOS-2007', 'ORTOS-2004',
+                                     'ORTOS-1995']
             if collection_indices:
                 collections = [available_collections[i] for i in collection_indices]
             else:
@@ -1298,7 +1345,14 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                         
                         # Build overviews if requested
                         if build_overviews:
-                            self.build_vrt_overviews(vrt_path, feedback)
+                            collection_dir = os.path.join(output_folder, collection)
+                            if self.rasters_have_overviews(collection_dir, feedback):
+                                feedback.pushInfo(
+                                    f"Skipping overview build for {collection}: "
+                                    "source rasters already have pyramids and the VRT uses them directly"
+                                )
+                            else:
+                                self.build_vrt_overviews(vrt_path, feedback)
                         
                         # Load VRT to QGIS if requested
                         if load_vrt:
