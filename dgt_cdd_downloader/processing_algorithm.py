@@ -7,20 +7,29 @@ import math
 import requests
 import os
 import json
+import re
 import time
 import urllib.parse
 import glob
 import ssl
+import queue
+from collections import namedtuple
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Dict, List, Tuple, Optional
 from html.parser import HTMLParser
 
 from requests.adapters import HTTPAdapter
-from urllib3 import PoolManager
+from urllib3 import PoolManager, disable_warnings
+from urllib3.exceptions import InsecureRequestWarning
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from osgeo import gdal
+from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
+    QgsProcessingOutputVectorLayer,
+    QgsProcessingParameterAuthConfig,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterString,
@@ -41,13 +50,79 @@ from qgis.core import (
     QgsPointXY,
     QgsFields,
     QgsField,
-    QgsProcessingParameterVectorDestination,
     QgsProcessingContext,
     QgsProcessingFeedback,
     QgsVectorFileWriter,
-    QgsRasterLayer
+    QgsRasterLayer,
+    QgsApplication,
+    QgsAuthMethodConfig
 )
 import processing
+
+from .i18n import HELP_TEMPLATE, translate
+
+
+# Each dataset becomes one pair of toolbox entries (one per authentication mode).
+#   key: used in the algorithm id
+#   label: shown in the toolbox
+#   collections: selectable collections, in the order they appear in the dialog
+#   raster_collections: the collections a VRT can be built for
+#   default_collections: preselected indices. None means the parameter is optional
+#       and an empty selection downloads everything.
+#   cloud_optimized: rasters are COGs, so they already carry internal overviews
+#   show_region: add the region to each collection name in the dialog
+Dataset = namedtuple(
+    'Dataset',
+    'key label collections raster_collections default_collections cloud_optimized show_region'
+)
+
+AZORES_PREFIX = 'ACORES-'
+LIDAR_RASTER_COLLECTIONS = ['MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
+AZORES_RASTER_COLLECTIONS = [
+    'ACORES-MDE-1', 'ACORES-MDE-5', 'ACORES-MDE-10',
+    'ACORES-MDS-1', 'ACORES-MDS-5', 'ACORES-MDS-10'
+]
+ORTOS_COLLECTIONS = [
+    'ORTOS-2025', 'ORTOS-2021', 'ORTOS-2018', 'ORTOS-2015', 'ORTOS-2012',
+    'ORTOS-2010', 'ORTOS-2007', 'ORTOS-2004', 'ORTOS-1995'
+]
+
+DATASET_LIDAR = Dataset(
+    key='lidar',
+    label='LiDAR',
+    # New collections go at the end: scripts select collections by index
+    collections=['LAZ'] + LIDAR_RASTER_COLLECTIONS + ['ACORES-LAZ'] + AZORES_RASTER_COLLECTIONS,
+    raster_collections=LIDAR_RASTER_COLLECTIONS + AZORES_RASTER_COLLECTIONS,
+    default_collections=None,
+    cloud_optimized=False,
+    show_region=True
+)
+# Each ORTOS collection covers the whole country, so one has to be chosen explicitly
+DATASET_ORTOS = Dataset(
+    key='ortos',
+    label='ORTOS',
+    collections=ORTOS_COLLECTIONS,
+    raster_collections=ORTOS_COLLECTIONS,
+    default_collections=[0],
+    cloud_optimized=True,
+    show_region=False
+)
+DATASETS = (DATASET_LIDAR, DATASET_ORTOS)
+
+AUTH_PASSWORD = 'password'  # pragma: allowlist secret
+AUTH_MANAGER = 'authcfg'
+AUTH_MODES = (AUTH_PASSWORD, AUTH_MANAGER)
+
+# Results of a single file download
+DOWNLOADED, SKIPPED, FAILED = 'downloaded', 'skipped', 'failed'
+
+BOUNDARY_FILENAME = 'dgt_download_boundaries.gpkg'
+
+# Files handed to the download threads at a time. The session is checked between batches.
+DOWNLOAD_BATCH_SIZE = 10
+
+# How many times an area the portal cannot search is cut into quarters before giving up
+MAX_SEARCH_SPLITS = 3
 
 
 class SSLNoVerifyAdapter(HTTPAdapter):
@@ -75,6 +150,31 @@ class SSLNoVerifyAdapter(HTTPAdapter):
             block=block,
             ssl_context=context
         )
+
+
+class WorkerFeedback:
+    """
+    Stands in for the processing feedback inside download threads, which must not use it
+    directly. Messages wait here until the algorithm thread passes them on with flush().
+    """
+
+    def __init__(self, feedback):
+        self._feedback = feedback
+        self._messages = queue.Queue()
+
+    def isCanceled(self):
+        return self._feedback.isCanceled()
+
+    def pushInfo(self, message):
+        self._messages.put((self._feedback.pushInfo, message))
+
+    def reportError(self, message):
+        self._messages.put((self._feedback.reportError, message))
+
+    def flush(self):
+        while not self._messages.empty():
+            send, message = self._messages.get()
+            send(message)
 
 
 class AuthenticationError(Exception):
@@ -113,15 +213,18 @@ class KeycloakFormParser(HTMLParser):
 
 class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     """
-    QGIS Processing Algorithm for downloading DGT CDD data with cookie-based authentication
+    QGIS Processing Algorithm for downloading DGT CDD data with cookie-based authentication.
+
+    One class serves every toolbox entry: the dataset decides what can be downloaded
+    and the auth mode decides where the credentials come from.
     """
 
     # Constants
     INPUT_EXTENT = 'INPUT_EXTENT'
     INPUT_POLYGON = 'INPUT_POLYGON'
-    INPUT_METHOD = 'INPUT_METHOD'
     USERNAME = 'USERNAME'  # pragma: allowlist secret
     PASSWORD = 'PASSWORD'  # pragma: allowlist secret
+    AUTH_CONFIG = 'AUTH_CONFIG'
     OUTPUT_FOLDER = 'OUTPUT_FOLDER'
     DELAY = 'DELAY'
     COLLECTIONS = 'COLLECTIONS'
@@ -131,9 +234,14 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     CREATE_VRT = 'CREATE_VRT'
     BUILD_OVERVIEWS = 'BUILD_OVERVIEWS'
     LOAD_VRT = 'LOAD_VRT'
+    DISABLE_SSL_VERIFY = 'DISABLE_SSL_VERIFY'
+    CONCURRENT_DOWNLOADS = 'CONCURRENT_DOWNLOADS'
 
-    def __init__(self):
+    def __init__(self, dataset: Dataset = DATASET_LIDAR, auth_mode: str = AUTH_PASSWORD):
         super().__init__()
+        self.dataset = dataset
+        self.auth_mode = auth_mode
+
         self.stac_url = "https://cdd.dgterritorio.gov.pt/dgt-be/v1/search"
         self.auth_base_url = "https://auth.cdd.dgterritorio.gov.pt/realms/dgterritorio/protocol/openid-connect"
         self.redirect_uri = "https://cdd.dgterritorio.gov.pt/auth/callback"
@@ -152,31 +260,30 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             "Sec-Fetch-Site": "same-origin"
         }
 
-        self.available_collections = []
         self.session = requests.Session()
         self.session.headers.update(self.headers)
-
-        # Collections that are rasters (not LiDAR point clouds)
-        self.raster_collections = ['MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
 
         # Session management
         self.session_timeout = 25 * 60  # 25 minutes in seconds
         self.last_auth_time = 0
         self._username = None
         self._password = None
-        self._download_counter = 0
+        self._disable_ssl_verify = False
 
     def tr(self, string):
-        return QCoreApplication.translate('Processing', string)
+        return translate(string)
 
     def createInstance(self):
-        return DgtCddDownloaderAlgorithm()
+        return DgtCddDownloaderAlgorithm(self.dataset, self.auth_mode)
 
     def name(self):
-        return 'dgt_cdd_lidar_data_downloader'
+        suffix = '_authcfg' if self.auth_mode == AUTH_MANAGER else ''
+        return f'dgt_cdd_{self.dataset.key}_data_downloader{suffix}'
 
     def displayName(self):
-        return self.tr('DGT CDD Data Downloader')
+        if self.auth_mode == AUTH_MANAGER:
+            return self.tr('DGT CDD {} Downloader (QGIS auth manager)').format(self.dataset.label)
+        return self.tr('DGT CDD {} Downloader (password)').format(self.dataset.label)
 
 
 # Removed to avoid a subgroup creation
@@ -186,66 +293,45 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 #    def groupId(self):
 #        return 'dgt_cdd_portal'
 
+    def helpUrl(self):
+        return 'https://github.com/qgispt/dgtcd_downer'
+
     def shortHelpString(self):
-        return self.tr("""
-        Download geospatial LiDAR data from portuguese <a href='https://cdd.dgterritorio.gov.pt'>DGT (Direção-Geral do Território) - CDD Portal</a>.
+        if self.dataset is DATASET_ORTOS:
+            data = self.tr('orthophotos')
+            selection = self.tr('Choose at least one collection.')
+        else:
+            data = self.dataset.label
+            selection = self.tr('If no collection is selected, all of them are downloaded.')
 
-        This tool allows you to:
-        - Login with your DGT credentials (username and password)
-        - Select an area of interest using either:
-          * A bounding box extent (from map canvas or manual entry)
-          * A polygon layer (first feature or selected feature will be used)
-        - Download various geospatial LiDAR datasets from DGT CDD Portal
-        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m)
-        - Automatically organize files by collection
-        - Create VRT (Virtual Raster) files for raster collections
-        - Load VRT files automatically into QGIS
-        - Create boundary layers showing download areas
+        if self.auth_mode == AUTH_MANAGER:
+            login = self.tr('Login with DGT credentials stored in the QGIS Authentication System, '
+                            'using a "Basic Authentication" configuration (username and password)')
+            warning = ''
+        else:
+            login = self.tr('Login with your DGT credentials (username and password)')
+            warning = self.tr('Warning: the password is visible while typing and may be kept in the Processing '
+                              'log and history. On shared computers use the "QGIS auth manager" version of this tool.')
 
-        Requirements:
-        - Valid credentials for the <a href='https://cdd.dgterritorio.gov.pt'>DGT - CDD Portal</a>
-        - Internet connection
-
-        The tool will automatically handle the authentication process using session cookies and divide large areas into smaller chunks to avoid server overload.
-
-        -------------------------------------------------
-
-        Serviço de descarregamento de dados geográficos LiDAR da DGT (Direção-Geral do Território) - Centro de Dados.
-        (https://cdd.dgterritorio.gov.pt)
-
-        Esta ferramenta permite:
-        - Fazer login no Centro de dados da DGT com as suas credenciais (username e password)
-        - Selecionar uma área de interesse utilizando:
-          * Uma extensão retangular (obtida a partir do mapa ou introduzindo as coordenadas manualmente)
-          * Uma camada de polígonos (será usado o primeiro polígono da camada ou o polígono selecionado)
-        - Descarregar as várias coleções de dados LiDAR disponíveis no Centro de Dados da DGT
-        (LAZ, MDS-50cm, MDS-2m, MDT-50cm, MDT-2m)
-        - Organizar os ficheiros descarregados por coleção
-        - Criar ficheiros VRT (Virtual Raster) para as coleções de rasters
-        - Carregar automaticamente os VRT no QGIS
-        - Criar uma layer com a extensão das áreas de download
-
-        Requisitos:
-        - Credenciais válidas do <a href='https://cdd.dgterritorio.gov.pt'>Centro de Dados da DGT</a>
-        - Ligação à Internet
-
-        Esta ferramenta vai gerir automaticamente o processo de autenticação usando cookies de sessão e dividir áreas grandes em partes mais pequenas, respeitando os limites impostos pelo servidor.
-
-        """)
-
-    def initAlgorithm(self, config=None):
-        # Input method selection
-        self.addParameter(
-            QgsProcessingParameterEnum(
-                self.INPUT_METHOD,
-                self.tr('Input Method'),
-                options=[self.tr('Extent (Bounding Box)'), self.tr('Polygon Layer')],
-                defaultValue=0,
-                optional=False
-            )
+        return self.tr(HELP_TEMPLATE).format(
+            data=data, login=login, selection=selection, warning=warning,
+            collections=', '.join(self.dataset.collections)
         )
 
-        # Input extent (shown when extent method is selected)
+    def collection_label(self, collection: str) -> str:
+        """Name of a collection in the dialog"""
+        if not self.dataset.show_region:
+            return collection
+        region = self.tr('Azores') if collection.startswith(AZORES_PREFIX) else 'PT'
+        return f'{collection} ({region})'
+
+    def addAdvancedParameter(self, parameter):
+        """Add a parameter to the collapsed Advanced Parameters group of the dialog"""
+        parameter.setFlags(parameter.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(parameter)
+
+    def initAlgorithm(self, config=None):
+        # Area of interest: the polygon layer replaces the extent when set
         self.addParameter(
             QgsProcessingParameterExtent(
                 self.INPUT_EXTENT,
@@ -255,36 +341,57 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Input polygon layer (shown when polygon method is selected)
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_POLYGON,
-                self.tr('Area of Interest (Polygon Layer)'),
+                self.tr('Area of Interest (Polygon Layer, replaces the extent)'),
                 types=[QgsProcessing.TypeVectorPolygon],
                 optional=True
             )
         )
 
         # Authentication parameters
-        self.addParameter(
-            QgsProcessingParameterString(
-                self.USERNAME,
-                self.tr('Username'),
-                multiLine=False,
-                defaultValue='',
-                optional=False
+        if self.auth_mode == AUTH_MANAGER:
+            self.addParameter(
+                QgsProcessingParameterAuthConfig(
+                    self.AUTH_CONFIG,
+                    self.tr('Authentication configuration'),
+                    defaultValue=None,
+                    optional=False
+                )
             )
-        )
+        else:
+            self.addParameter(
+                QgsProcessingParameterString(
+                    self.USERNAME,
+                    self.tr('Username'),
+                    multiLine=False,
+                    defaultValue='',
+                    optional=False
+                )
+            )
 
-        # Password parameter (Note: QGIS Processing doesn't support native password fields)
-        # The password will be visible while typing - use with caution in shared environments
+            # Password parameter (Note: QGIS Processing doesn't support native password fields)
+            # The password will be visible while typing - use with caution in shared environments
+            self.addParameter(
+                QgsProcessingParameterString(
+                    self.PASSWORD,
+                    self.tr('Password'),
+                    multiLine=False,
+                    defaultValue='',
+                    optional=False
+                )
+            )
+
+        # Collections (predefined options)
         self.addParameter(
-            QgsProcessingParameterString(
-                self.PASSWORD,
-                self.tr('Password'),
-                multiLine=False,
-                defaultValue='',
-                optional=False
+            QgsProcessingParameterEnum(
+                self.COLLECTIONS,
+                self.tr('Collections to download'),
+                options=[self.collection_label(collection) for collection in self.dataset.collections],
+                allowMultiple=True,
+                defaultValue=self.dataset.default_collections,
+                optional=self.dataset.default_collections is None
             )
         )
 
@@ -296,8 +403,8 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Optional parameters
-        self.addParameter(
+        # Everything below stays collapsed in the dialog
+        self.addAdvancedParameter(
             QgsProcessingParameterNumber(
                 self.DELAY,
                 self.tr('Delay between requests (seconds)'),
@@ -308,7 +415,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(
+        self.addAdvancedParameter(
             QgsProcessingParameterNumber(
                 self.MAX_AREA,
                 self.tr('Maximum area per request (km²)'),
@@ -319,19 +426,19 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Collections (predefined options)
-        self.addParameter(
-            QgsProcessingParameterEnum(
-                self.COLLECTIONS,
-                self.tr('Collections to download'),
-                options=['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm'],
-                allowMultiple=True,
-                optional=True
+        self.addAdvancedParameter(
+            QgsProcessingParameterNumber(
+                self.CONCURRENT_DOWNLOADS,
+                self.tr('Simultaneous downloads'),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=1,
+                minValue=1,
+                maxValue=2
             )
         )
 
         # VRT options
-        self.addParameter(
+        self.addAdvancedParameter(
             QgsProcessingParameterBoolean(
                 self.CREATE_VRT,
                 self.tr('Create VRT files for raster collections'),
@@ -340,16 +447,18 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.BUILD_OVERVIEWS,
-                self.tr('Build overviews (pyramids) for VRT files'),
-                defaultValue=True,
-                optional=True
+        # COGs have internal overviews, which the VRT uses directly
+        if not self.dataset.cloud_optimized:
+            self.addAdvancedParameter(
+                QgsProcessingParameterBoolean(
+                    self.BUILD_OVERVIEWS,
+                    self.tr('Build overviews (pyramids) for VRT files'),
+                    defaultValue=True,
+                    optional=True
+                )
             )
-        )
 
-        self.addParameter(
+        self.addAdvancedParameter(
             QgsProcessingParameterBoolean(
                 self.LOAD_VRT,
                 self.tr('Load VRT files into QGIS'),
@@ -359,7 +468,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
         )
 
         # Create boundary layer
-        self.addParameter(
+        self.addAdvancedParameter(
             QgsProcessingParameterBoolean(
                 self.CREATE_BOUNDARY_LAYER,
                 self.tr('Create boundary layer showing download areas'),
@@ -368,15 +477,73 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(
-            QgsProcessingParameterVectorDestination(
-                self.BOUNDARY_OUTPUT,
-                self.tr('Boundary Layer'),
-                type=QgsProcessing.TypeVectorPolygon,
-                optional=True,
-                createByDefault=True
+        self.addAdvancedParameter(
+            QgsProcessingParameterBoolean(
+                self.DISABLE_SSL_VERIFY,
+                self.tr('Disable SSL certificate verification (only for networks with SSL inspection)'),
+                defaultValue=False,
+                optional=True
             )
         )
+
+        self.addOutput(
+            QgsProcessingOutputVectorLayer(
+                self.BOUNDARY_OUTPUT,
+                self.tr('Boundary Layer'),
+                QgsProcessing.TypeVectorPolygon
+            )
+        )
+
+    def checkParameterValues(self, parameters, context):
+        """Require an area of interest: both inputs are optional, but one of them is needed"""
+        ok, message = super().checkParameterValues(parameters, context)
+        if not ok:
+            return ok, message
+
+        has_polygon = bool(parameters.get(self.INPUT_POLYGON))
+        if not has_polygon and self.parameterAsExtent(parameters, self.INPUT_EXTENT, context).isNull():
+            return False, self.tr('Please set an extent or a polygon layer as the area of interest')
+
+        return True, ''
+
+    def read_auth_manager_credentials(self, parameters, context) -> Tuple[str, str]:
+        """Read username and password from a QGIS authentication configuration"""
+        auth_id = self.parameterAsString(parameters, self.AUTH_CONFIG, context)
+        if not auth_id:
+            raise QgsProcessingException(self.tr('An authentication configuration is required'))
+
+        # Check the config itself: this call returns a bool or a tuple depending on the QGIS version
+        auth_config = QgsAuthMethodConfig()
+        QgsApplication.authManager().loadAuthenticationConfig(auth_id, auth_config, True)
+        if not auth_config.isValid():
+            raise QgsProcessingException(
+                self.tr('Could not load authentication configuration {}').format(auth_id)
+            )
+
+        if auth_config.method() != 'Basic':
+            raise QgsProcessingException(
+                self.tr('The authentication configuration must use the "Basic Authentication" '
+                        'method, not {}').format(auth_config.method())
+            )
+
+        return auth_config.config('username'), auth_config.config('password')
+
+    def prepareAlgorithm(self, parameters, context, feedback):
+        """
+        Read the credentials. This runs on the main thread, unlike processAlgorithm,
+        which lets QGIS safely ask for the authentication master password.
+        """
+        if self.auth_mode == AUTH_MANAGER:
+            self._username, self._password = self.read_auth_manager_credentials(parameters, context)
+        else:
+            self._username = self.parameterAsString(parameters, self.USERNAME, context)
+            self._password = self.parameterAsString(parameters, self.PASSWORD, context)
+
+        if not self._username or not self._password:
+            raise QgsProcessingException(self.tr('Username and password are required'))
+
+        self._disable_ssl_verify = self.parameterAsBool(parameters, self.DISABLE_SSL_VERIFY, context)
+        return True
 
     def is_session_valid(self, feedback: QgsProcessingFeedback) -> bool:
         """Check if the current session is still valid"""
@@ -395,6 +562,13 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"Session validation error: {e}")
             return False
 
+    def refresh_session(self, feedback: QgsProcessingFeedback):
+        """Log in again if the session has expired. Never call this while files are downloading."""
+        if self.is_session_expired() or not self.is_session_valid(feedback):
+            feedback.pushInfo("Session expired or invalid, re-authenticating...")
+            if not self.authenticate(self._username, self._password, feedback):
+                raise AuthenticationError("Re-authentication failed")
+
     def is_session_expired(self):
         """Check if session has likely expired based on time"""
         return (time.time() - self.last_auth_time) > self.session_timeout
@@ -407,12 +581,14 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             # Create a fresh session
             self.session = requests.Session()
 
-            # Mount the custom adapter to forcefully disable SSL verification for all requests.
-            # This is a robust workaround for environments with SSL inspection proxies
-            # that interfere with standard certificate validation.
-            feedback.pushWarning("Mounting custom adapter to disable SSL verification for the entire session.")
-            self.session.mount('https://', SSLNoVerifyAdapter())
-            self.session.mount('http://', SSLNoVerifyAdapter())
+            # Opt-in workaround for environments with SSL inspection proxies that
+            # interfere with standard certificate validation.
+            if self._disable_ssl_verify:
+                feedback.pushWarning("SSL certificate verification is disabled for this session.")
+                disable_warnings(InsecureRequestWarning)
+                self.session.verify = False
+                self.session.mount('https://', SSLNoVerifyAdapter())
+                self.session.mount('http://', SSLNoVerifyAdapter())
 
             self.session.headers.update(self.headers)
 
@@ -507,13 +683,20 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 
             # Step 7: Check for authentication errors
             if "error" in response.url.lower() or response.status_code >= 400:
-                feedback.reportError("Authentication failed - check credentials")
+                feedback.reportError(self.tr("Authentication failed - check credentials"))
                 return False
 
             # If we get here, something unexpected happened
             feedback.reportError(f"Unexpected response: {response.status_code}, URL: {response.url}")
             return False
 
+        except requests.exceptions.SSLError as e:
+            feedback.reportError(
+                self.tr("Could not verify the server's SSL certificate: {}\n"
+                        "If your network uses SSL inspection, enable 'Disable SSL certificate "
+                        "verification' under Advanced Parameters.").format(e)
+            )
+            return False
         except requests.RequestException as e:
             feedback.reportError(f"Network error during authentication: {e}")
             return False
@@ -522,16 +705,17 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             return False
 
     def get_file_extension(self, mime_type: str) -> str:
-        """Get file extension based on MIME type"""
+        """Get file extension based on MIME type, ignoring parameters such as
+        'application=geotiff' or 'profile=cloud-optimized'"""
         mime_to_extension = {
-            "image/tiff; application=geotiff": ".tif",
             "image/tiff": ".tif",
             "application/vnd.laszip": ".laz",
             "application/octet-stream": ".bin",
             "application/json": ".json",
             "text/xml": ".xml"
         }
-        return mime_to_extension.get(mime_type, ".bin")
+        media_type = mime_type.split(";", 1)[0].strip().lower()
+        return mime_to_extension.get(media_type, ".bin")
 
     def divide_bbox(self, bbox: List[float], max_area_km2: float) -> List[List[float]]:
         """Divide large bounding box into smaller chunks"""
@@ -606,71 +790,103 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 
         return small_polygons
 
-    def search_stac_api_bbox(self, bbox: List[float], collections: List[str] = None, 
-                           delay: float = 0.2) -> Dict:
-        """Search STAC API for items in bounding box"""
-        payload = {
-            "bbox": bbox,
-            "limit": 1000
-        }
-        if collections:
-            payload["collections"] = collections
-
-        time.sleep(delay)
-
+    def post_stac_search(self, payload: Dict) -> Dict:
+        """Run one STAC API search, logging failures as an empty result"""
         try:
-            response = self.session.post(
-                self.stac_url, 
-                json=payload, 
-                timeout=30
-            )
+            response = self.session.post(self.stac_url, json=payload, timeout=30)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
             QgsMessageLog.logMessage(
-                f"STAC API error for bbox {bbox}: {e}",
+                f"STAC API error for {payload}: {e}",
                 "DGT Downloader",
                 Qgis.Warning
             )
             return {"features": []}
 
-    def search_stac_api_geometry(self, geometry: QgsGeometry, collections: List[str] = None, 
-                               delay: float = 0.2) -> Dict:
-        """Search STAC API for items intersecting with geometry"""
-        # Convert QgsGeometry to GeoJSON format
-        geom_json = json.loads(geometry.asJson())
+    def area_query(self, area) -> Dict:
+        """STAC search terms for an area, given as a bbox list or a QgsGeometry"""
+        if not isinstance(area, QgsGeometry):
+            return {"bbox": area}
 
-        payload = {
+        return {
             "filter": {
                 "op": "intersects",
                 "args": [
                     {"property": "geometry"},
-                    geom_json
+                    json.loads(area.asJson())
                 ]
-            },
-            "limit": 1000
+            }
         }
 
-        if collections:
-            payload["collections"] = collections
+    def split_area(self, area) -> List:
+        """Cut an area, given as a bbox list or a QgsGeometry, into quarters"""
+        is_geometry = isinstance(area, QgsGeometry)
+        if is_geometry:
+            rect = area.boundingBox()
+            min_x, min_y, max_x, max_y = rect.xMinimum(), rect.yMinimum(), rect.xMaximum(), rect.yMaximum()
+        else:
+            min_x, min_y, max_x, max_y = area
 
+        mid_x, mid_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+        quarters = [
+            [min_x, min_y, mid_x, mid_y], [mid_x, min_y, max_x, mid_y],
+            [min_x, mid_y, mid_x, max_y], [mid_x, mid_y, max_x, max_y]
+        ]
+        if not is_geometry:
+            return quarters
+
+        parts = [area.intersection(QgsGeometry.fromRect(QgsRectangle(*quarter))) for quarter in quarters]
+        return [part for part in parts if not part.isEmpty() and part.area() > 0]
+
+    def search_stac_api(self, area, collections: List[str], delay: float,
+                        feedback: QgsProcessingFeedback, splits_left: int = MAX_SEARCH_SPLITS) -> Dict:
+        """
+        Search the STAC API for items in an area, given as a bbox list or a QgsGeometry.
+
+        Two kinds of result need more searches:
+        - Responses are capped at `limit` items, so a search can be cut short.
+        - Some ACORES-LAZ items make the portal answer with an error object, with HTTP 200.
+          That fails the whole search, even for the other collections and the rest of the area.
+
+        Both are handled by searching each collection on its own. A collection that still
+        fails is then searched in smaller parts, to keep everything around the bad items.
+        """
         time.sleep(delay)
+        result = self.post_stac_search({**self.area_query(area), "limit": 1000, "collections": collections})
 
-        try:
-            response = self.session.post(
-                self.stac_url, 
-                json=payload, 
-                timeout=30
+        failed = "code" in result
+        context = result.get("context", {})
+        matched = context.get("matched", 0)
+        returned = context.get("returned", matched)
+        if not failed and matched <= returned:
+            return result
+
+        if len(collections) > 1:
+            parts = [(area, [collection], splits_left) for collection in collections]
+        elif not failed:
+            feedback.pushWarning(
+                self.tr('{}: only {} of {} items returned. Try a smaller maximum area.').format(
+                    collections[0], returned, matched
+                )
             )
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            QgsMessageLog.logMessage(
-                f"STAC API error for geometry {geom_json}: {e}",
-                "DGT Downloader",
-                Qgis.Warning
+            return result
+        elif splits_left > 0:
+            parts = [(part, collections, splits_left - 1) for part in self.split_area(area)]
+        else:
+            location = area.boundingBox().toString(4) if isinstance(area, QgsGeometry) else area
+            feedback.pushWarning(
+                self.tr('{}: the portal could not search area {}, so tiles there may be missing.').format(
+                    collections[0], location
+                )
             )
             return {"features": []}
+
+        features = []
+        for part_area, part_collections, part_splits in parts:
+            part_result = self.search_stac_api(part_area, part_collections, delay, feedback, part_splits)
+            features.extend(part_result.get("features", []))
+        return {"features": features}
 
     def collect_urls_per_collection(self, stac_response: Dict) -> Dict[str, List[Tuple[str, str, str]]]:
         """Collect download URLs organized by collection"""
@@ -690,6 +906,12 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             if not item_id:
                 item_id = item.get("id", "unknown")
 
+            # File name carries the version, as in MDS-50cm-163556-07-2025_v02.
+            # Azores items have no version.
+            version = item.get("properties", {}).get("version")
+            if version:
+                item_id = f"{item_id}_v{str(version).zfill(2)}"
+
             # Process assets
             assets = item.get("assets", {})
             for asset_key, asset in assets.items():
@@ -706,24 +928,23 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
         return urls_per_collection
 
     def download_file(self, url: str, item_id: str, extension: str, 
-                     output_dir: str, delay: float,
-                     feedback: QgsProcessingFeedback) -> bool:
-        """Download a single file with session validation and retry logic"""
-        # Check session validity periodically
-        self._download_counter += 1
-        if self._download_counter % 10 == 0:  # Check every 10 files
-            if self.is_session_expired() or not self.is_session_valid(feedback):
-                feedback.pushInfo("Session expired or invalid, re-authenticating...")
-                if not self.authenticate(self._username, self._password, feedback):
-                    raise AuthenticationError("Re-authentication failed")
+                     output_dir: str, delay: float, feedback: WorkerFeedback) -> str:
+        """
+        Download a single file with retry logic. Runs in a download thread.
+        Returns DOWNLOADED, SKIPPED or FAILED.
+        """
+        if feedback.isCanceled():
+            return FAILED
 
         filename = f"{item_id}{extension}"
         file_path = os.path.join(output_dir, filename)
+        # Only complete files get the final name, so a later run can trust "file exists"
+        part_path = f"{file_path}.part"
 
         # Skip if file exists
         if os.path.exists(file_path):
             feedback.pushInfo(f"Skipping {filename}: file already exists")
-            return False
+            return SKIPPED
 
         feedback.pushInfo(f"Downloading {filename}...")
         time.sleep(delay)
@@ -752,24 +973,22 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 # Create output directory
                 os.makedirs(output_dir, exist_ok=True)
 
-                # Download with progress
-                total_size = int(response.headers.get('Content-Length', 0))
-                downloaded = 0
-
-                with open(file_path, "wb") as f:
+                canceled = False
+                with open(part_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if feedback.isCanceled():
-                            return False
+                            canceled = True
+                            break
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
 
-                            if total_size > 0:
-                                progress = int(100 * downloaded / total_size)
-                                feedback.setProgress(progress)
+                if canceled:
+                    os.remove(part_path)
+                    return FAILED
 
+                os.replace(part_path, file_path)
                 feedback.pushInfo(f"Downloaded {filename} successfully")
-                return True
+                return DOWNLOADED
 
             except requests.exceptions.RequestException as e:
                 # This broad exception catches ConnectionError, Timeout, SSLError, etc.
@@ -781,27 +1000,89 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                     continue
                 else:
                     feedback.reportError(f"Failed to download {filename} after {max_retries} attempts: {str(e)}")
-                    return False
+                    return FAILED
 
             except Exception as e:
                 feedback.reportError(f"Error downloading {url}: {e}")
-                return False
+                return FAILED
 
-        return False
+        return FAILED
 
-    def create_vrt_for_collection(self, collection: str, output_dir: str, 
-                                 feedback: QgsProcessingFeedback) -> Optional[str]:
-        """Create a VRT file for a raster collection"""
+    def download_files(self, urls: List[Tuple[str, str, str]], output_dir: str, delay: float,
+                       workers: int, results: Dict[str, int], total_files: int,
+                       feedback: QgsProcessingFeedback):
+        """Download files with `workers` threads, adding each outcome to `results`"""
+        worker_feedback = WorkerFeedback(feedback)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for start in range(0, len(urls), DOWNLOAD_BATCH_SIZE):
+                if feedback.isCanceled():
+                    return
+
+                self.refresh_session(feedback)
+
+                pending = {
+                    executor.submit(
+                        self.download_file, url, item_id, extension, output_dir, delay, worker_feedback
+                    )
+                    for url, item_id, extension in urls[start:start + DOWNLOAD_BATCH_SIZE]
+                }
+                while pending:
+                    done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    worker_feedback.flush()
+                    for future in done:
+                        results[future.result()] += 1
+                        feedback.setProgress(int(100 * sum(results.values()) / total_files))
+
+    def group_rasters_by_crs(self, raster_files: List[str]) -> List[Tuple]:
+        """
+        Group rasters by CRS as (spatial reference, files), largest group first.
+        gdalbuildvrt leaves out files with a different CRS, and Azores tiles do differ.
+        """
+        groups = []
+        for raster_file in sorted(raster_files):
+            try:
+                srs = gdal.Open(raster_file).GetSpatialRef()
+            except (AttributeError, RuntimeError):
+                srs = None
+
+            for group_srs, group_files in groups:
+                if (srs is None and group_srs is None) or (srs and group_srs and srs.IsSame(group_srs)):
+                    group_files.append(raster_file)
+                    break
+            else:
+                groups.append((srs, [raster_file]))
+
+        return sorted(groups, key=lambda group: len(group[1]), reverse=True)
+
+    def latest_versions(self, raster_files: List[str]) -> List[str]:
+        """Keep the newest file of each tile, so a VRT never mixes a corrected tile with its old copy"""
+        latest = {}
+        for raster_file in raster_files:
+            stem = os.path.splitext(raster_file)[0]
+            match = re.search(r'_v(\d+)$', stem)
+            tile = stem[:match.start()] if match else stem
+            # Files from before versioned names have no version, so any versioned file is newer
+            version = int(match.group(1)) if match else -1
+            if tile not in latest or version > latest[tile][0]:
+                latest[tile] = (version, raster_file)
+
+        return [raster_file for _, raster_file in latest.values()]
+
+    def create_vrts_for_collection(self, collection: str, output_dir: str,
+                                 context: QgsProcessingContext,
+                                  feedback: QgsProcessingFeedback) -> List[str]:
+        """Create the VRT files for a raster collection: one, unless its files mix CRSs"""
         try:
             # Only create VRT for raster collections
-            if collection not in self.raster_collections:
+            if collection not in self.dataset.raster_collections:
                 feedback.pushInfo(f"Skipping VRT creation for {collection} (not a raster collection)")
-                return None
+                return []
 
             collection_dir = os.path.join(output_dir, collection)
             if not os.path.exists(collection_dir):
                 feedback.pushInfo(f"Collection directory {collection_dir} does not exist")
-                return None
+                return []
 
             # Find all raster files in the collection directory
             raster_patterns = ['*.tif', '*.tiff', '*.TIF', '*.TIFF']
@@ -812,49 +1093,76 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 
             if not raster_files:
                 feedback.pushInfo(f"No raster files found in {collection_dir}")
-                return None
+                return []
 
             feedback.pushInfo(f"Found {len(raster_files)} raster files for {collection}")
 
-            # Create VRT file path
-            vrt_filename = f"{collection}.vrt"
-            vrt_path = os.path.join(output_dir, vrt_filename)
+            current_files = self.latest_versions(raster_files)
+            if len(current_files) < len(raster_files):
+                feedback.pushInfo(
+                    f"Leaving {len(raster_files) - len(current_files)} older tile versions out of the VRT"
+                )
 
-            # Use GDAL's buildvrt through processing
-            vrt_params = {
-                'INPUT': raster_files,
-                'OUTPUT': vrt_path,
-                'RESOLUTION': 0,  # Use average resolution
-                'SEPARATE': False,  # Merge into single band
-                'PROJ_DIFFERENCE': False,  # Don't allow projection differences
-                'ADD_ALPHA': False,
-                'ASSIGN_CRS': None,
-                'RESAMPLING': 0,  # Nearest neighbor
-                'SRC_NODATA': '',
-                'EXTRA': ''
-            }
+            groups = self.group_rasters_by_crs(current_files)
+            if len(groups) > 1:
+                feedback.pushInfo(f"{collection} mixes {len(groups)} CRSs: creating one VRT for each")
 
-            feedback.pushInfo(f"Creating VRT file for {collection}...")
+            vrt_paths = []
+            for index, (srs, group_files) in enumerate(groups):
+                vrt_name = collection
+                if index > 0:
+                    code = srs.GetAuthorityCode(None) if srs else None
+                    vrt_name = f"{collection}_EPSG{code}" if code else f"{collection}_{index + 1}"
 
-            # Run the buildvrt algorithm
-            result = processing.run(
-                "gdal:buildvirtualraster",
-                vrt_params,
-                feedback=feedback
-            )
+                vrt_path = self.create_vrt(group_files, vrt_name, output_dir, context, feedback)
+                if vrt_path:
+                    vrt_paths.append(vrt_path)
 
-            if result and os.path.exists(vrt_path):
-                feedback.pushInfo(f"VRT file created successfully: {vrt_path}")
-                return vrt_path
-            else:
-                feedback.reportError(f"Failed to create VRT file for {collection}")
-                return None
+            return vrt_paths
 
         except Exception as e:
             feedback.reportError(f"Error creating VRT for {collection}: {str(e)}")
-            return None
+            return []
 
-    def build_vrt_overviews(self, vrt_path: str, feedback: QgsProcessingFeedback) -> bool:
+    def create_vrt(self, raster_files: List[str], vrt_name: str, output_dir: str,
+                   context: QgsProcessingContext, feedback: QgsProcessingFeedback) -> Optional[str]:
+        """Create one VRT file from rasters that share a CRS"""
+        vrt_path = os.path.join(output_dir, f"{vrt_name}.vrt")
+
+        # Use GDAL's buildvrt through processing
+        vrt_params = {
+            'INPUT': raster_files,
+            'OUTPUT': vrt_path,
+            'RESOLUTION': 0,  # Use average resolution
+            'SEPARATE': False,  # Merge into single band
+            'PROJ_DIFFERENCE': False,  # Don't allow projection differences
+            'ADD_ALPHA': False,
+            'ASSIGN_CRS': None,
+            'RESAMPLING': 0,  # Nearest neighbor
+            'SRC_NODATA': '',
+            'EXTRA': ''
+        }
+
+        feedback.pushInfo(f"Creating VRT file {vrt_name}.vrt...")
+
+        # Run the buildvrt algorithm
+        result = processing.run(
+            "gdal:buildvirtualraster",
+            vrt_params,
+            context=context,
+            feedback=feedback,
+            is_child_algorithm=True
+        )
+
+        if result and os.path.exists(vrt_path):
+            feedback.pushInfo(f"VRT file created successfully: {vrt_path}")
+            return vrt_path
+
+        feedback.reportError(f"Failed to create VRT file {vrt_name}.vrt")
+        return None
+
+    def build_vrt_overviews(self, vrt_path: str, context: QgsProcessingContext,
+                            feedback: QgsProcessingFeedback) -> bool:
         """Build overviews (pyramids) for a VRT file"""
         try:
             if not os.path.exists(vrt_path):
@@ -868,52 +1176,42 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 'INPUT': vrt_path,
                 'LEVELS': '2 4 8 16 32',  # Standard pyramid levels
                 'RESAMPLING': 0,  # Nearest neighbor
-                'FORMAT': 0,  # External (GTiff.ovr)
+                'FORMAT': 1,  # External (GTiff.ovr)
                 'EXTRA': ''
             }
 
             result = processing.run(
                 "gdal:overviews",
                 overview_params,
-                feedback=feedback
+                context=context,
+                feedback=feedback,
+                is_child_algorithm=True
             )
 
-            if result:
+            # The algorithm returns a result even when gdaladdo fails
+            ovr_path = f"{vrt_path}.ovr"
+            if result and os.path.exists(ovr_path):
                 feedback.pushInfo(f"Successfully built overviews for {os.path.basename(vrt_path)}")
                 return True
             else:
-                feedback.reportError(f"Failed to build overviews for {os.path.basename(vrt_path)}")
+                feedback.reportError(
+                    f"Failed to build overviews for {os.path.basename(vrt_path)}: "
+                    f"{ovr_path} was not created. Check the available disk space."
+                )
                 return False
 
         except Exception as e:
             feedback.reportError(f"Error building overviews for {os.path.basename(vrt_path)}: {str(e)}")
             return False
 
-    def load_vrt_to_qgis(self, vrt_path: str, collection: str, 
-                        feedback: QgsProcessingFeedback) -> bool:
-        """Load VRT file into QGIS"""
-        try:
-            if not os.path.exists(vrt_path):
-                feedback.reportError(f"VRT file does not exist: {vrt_path}")
-                return False
-
-            # Create raster layer
-            layer_name = f"DGT_{collection}"
-            raster_layer = QgsRasterLayer(vrt_path, layer_name)
-
-            if not raster_layer.isValid():
-                feedback.reportError(f"Failed to create raster layer from {vrt_path}")
-                return False
-
-            # Add layer to project
-            QgsProject.instance().addMapLayer(raster_layer)
-            feedback.pushInfo(f"Added {layer_name} to QGIS project")
-
-            return True
-
-        except Exception as e:
-            feedback.reportError(f"Error loading VRT to QGIS: {str(e)}")
-            return False
+    def load_layer_on_completion(self, path: str, name: str, context: QgsProcessingContext):
+        """
+        Queue a layer to be added to the project when the algorithm finishes.
+        The project must not be touched from processAlgorithm, which runs in a background thread.
+        """
+        details = QgsProcessingContext.LayerDetails(name, context.project(), name)
+        details.forceName = True
+        context.addLayerToLoadOnCompletion(path, details)
 
     def create_boundary_layer_bbox(self, bboxes: List[List[float]], output_path: str, 
                                 context: QgsProcessingContext, feedback: QgsProcessingFeedback) -> str:
@@ -1072,61 +1370,25 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         """Main processing algorithm"""
         try:
-            # Get parameters
-            input_method = self.parameterAsEnum(parameters, self.INPUT_METHOD, context)
-            extent = self.parameterAsExtent(parameters, self.INPUT_EXTENT, context) if input_method == 0 else None
-            polygon_source = self.parameterAsSource(parameters, self.INPUT_POLYGON, context) if input_method == 1 else None
-            self._username = self.parameterAsString(parameters, self.USERNAME, context)
-            self._password = self.parameterAsString(parameters, self.PASSWORD, context)
+            # Get parameters (credentials were read in prepareAlgorithm)
+            polygon_source = self.parameterAsSource(parameters, self.INPUT_POLYGON, context)
+            use_polygon = polygon_source is not None
             output_folder = self.parameterAsString(parameters, self.OUTPUT_FOLDER, context)
             delay = self.parameterAsDouble(parameters, self.DELAY, context)
             max_area = self.parameterAsDouble(parameters, self.MAX_AREA, context)
+            workers = self.parameterAsInt(parameters, self.CONCURRENT_DOWNLOADS, context)
             collection_indices = self.parameterAsEnums(parameters, self.COLLECTIONS, context)
             create_vrt = self.parameterAsBool(parameters, self.CREATE_VRT, context)
-            build_overviews = False
-            if create_vrt:
-                build_overviews = self.parameterAsBool(parameters, self.BUILD_OVERVIEWS, context)
+            build_overviews = (
+                create_vrt
+                and not self.dataset.cloud_optimized
+                and self.parameterAsBool(parameters, self.BUILD_OVERVIEWS, context)
+            )
             load_vrt = self.parameterAsBool(parameters, self.LOAD_VRT, context)
             create_boundary = self.parameterAsBool(parameters, self.CREATE_BOUNDARY_LAYER, context)
-            boundary_output = self.parameterAsOutputLayer(parameters, self.BOUNDARY_OUTPUT, context)
-
-            # Initialize download counter
-            self._download_counter = 0
-
-            # Validate inputs
-            if not self._username or not self._password:
-                raise QgsProcessingException("Username and password are required")
 
             # Handle input based on method
-            if input_method == 0:  # Extent method
-                if extent.isNull():
-                    raise QgsProcessingException("Please specify an area of interest extent")
-
-                # Convert extent to WGS84 if needed
-                extent_crs = self.parameterAsExtentCrs(parameters, self.INPUT_EXTENT, context)
-                if extent_crs != QgsCoordinateReferenceSystem('EPSG:4326'):
-                    transform = QgsCoordinateTransform(
-                        extent_crs,
-                        QgsCoordinateReferenceSystem('EPSG:4326'),
-                        context.project()
-                    )
-                    extent = transform.transformBoundingBox(extent)
-
-                # Convert to bbox list
-                bbox = [extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()]
-
-                feedback.pushInfo(f"Processing extent: {bbox}")
-
-                # Divide large areas into smaller chunks
-                feedback.pushInfo("Dividing area into smaller chunks...")
-                small_bboxes = self.divide_bbox(bbox, max_area)
-                feedback.pushInfo(f"Created {len(small_bboxes)} download chunks")
-
-            else:  # Polygon method
-                polygon_source = self.parameterAsSource(parameters, self.INPUT_POLYGON, context)
-                if polygon_source is None:
-                    raise QgsProcessingException("Please specify a polygon layer for area of interest")
-
+            if use_polygon:
                 # Get first feature (from selection if any)
                 features = polygon_source.getFeatures()
                 try:
@@ -1152,13 +1414,38 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 small_polygons = self.divide_polygon(polygon, max_area)
                 feedback.pushInfo(f"Created {len(small_polygons)} download chunks")
 
+            else:
+                extent = self.parameterAsExtent(parameters, self.INPUT_EXTENT, context)
+                if extent.isNull():
+                    raise QgsProcessingException("Please specify an area of interest extent")
+
+                # Convert extent to WGS84 if needed
+                extent_crs = self.parameterAsExtentCrs(parameters, self.INPUT_EXTENT, context)
+                if extent_crs != QgsCoordinateReferenceSystem('EPSG:4326'):
+                    transform = QgsCoordinateTransform(
+                        extent_crs,
+                        QgsCoordinateReferenceSystem('EPSG:4326'),
+                        context.project()
+                    )
+                    extent = transform.transformBoundingBox(extent)
+
+                # Convert to bbox list
+                bbox = [extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()]
+
+                feedback.pushInfo(f"Processing extent: {bbox}")
+
+                # Divide large areas into smaller chunks
+                feedback.pushInfo("Dividing area into smaller chunks...")
+                small_bboxes = self.divide_bbox(bbox, max_area)
+                feedback.pushInfo(f"Created {len(small_bboxes)} download chunks")
+
             # Authenticate
             feedback.pushInfo("Authenticating with DGT...")
             if not self.authenticate(self._username, self._password, feedback):
                 raise QgsProcessingException("Authentication failed")
 
             # Get collections to download
-            available_collections = ['LAZ', 'MDS-2m', 'MDS-50cm', 'MDT-2m', 'MDT-50cm']
+            available_collections = self.dataset.collections
             if collection_indices:
                 collections = [available_collections[i] for i in collection_indices]
             else:
@@ -1169,7 +1456,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             # Collect all download URLs
             all_urls_per_collection = {}
 
-            if input_method == 0:  # Extent method
+            if not use_polygon:  # Extent method
                 total_chunks = len(small_bboxes)
 
                 for i, small_bbox in enumerate(small_bboxes):
@@ -1180,13 +1467,10 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                     feedback.setProgress(int(100 * i / total_chunks))
 
                     # Check session before each chunk
-                    if self.is_session_expired() or not self.is_session_valid(feedback):
-                        feedback.pushInfo("Session expired or invalid, re-authenticating...")
-                        if not self.authenticate(self._username, self._password, feedback):
-                            raise AuthenticationError("Re-authentication failed")
+                    self.refresh_session(feedback)
 
                     # Search STAC API
-                    stac_response = self.search_stac_api_bbox(small_bbox, collections, delay)
+                    stac_response = self.search_stac_api(small_bbox, collections, delay, feedback)
 
                     if not stac_response.get("features"):
                         feedback.pushInfo(f"No features found for chunk {i+1}")
@@ -1211,13 +1495,10 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                     feedback.setProgress(int(100 * i / total_chunks))
 
                     # Check session before each chunk
-                    if self.is_session_expired() or not self.is_session_valid(feedback):
-                        feedback.pushInfo("Session expired or invalid, re-authenticating...")
-                        if not self.authenticate(self._username, self._password, feedback):
-                            raise AuthenticationError("Re-authentication failed")
+                    self.refresh_session(feedback)
 
                     # Search STAC API with polygon geometry
-                    stac_response = self.search_stac_api_geometry(small_polygon, collections, delay)
+                    stac_response = self.search_stac_api(small_polygon, collections, delay, feedback)
 
                     if not stac_response.get("features"):
                         feedback.pushInfo(f"No features found for chunk {i+1}")
@@ -1244,7 +1525,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 
             # Download files
             total_files = sum(len(urls) for urls in all_urls_per_collection.values())
-            downloaded_files = 0
+            download_results = {DOWNLOADED: 0, SKIPPED: 0, FAILED: 0}
             vrt_files = []
 
             feedback.pushInfo(f"Found {total_files} files to download")
@@ -1263,60 +1544,53 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 os.makedirs(collection_dir, exist_ok=True)
 
                 # Download files
-                for url, item_id, extension in urls:
-                    if feedback.isCanceled():
-                        return {}
+                self.download_files(
+                    urls, collection_dir, delay, workers, download_results, total_files, feedback
+                )
 
-                    success = self.download_file(
-                        url, item_id, extension, collection_dir, delay, feedback
-                    )
-
-                    downloaded_files += 1
-                    feedback.setProgress(int(100 * downloaded_files / total_files))
-
-                    if not success:
-                        continue
+                if feedback.isCanceled():
+                    return {}
 
                 # Create VRT for raster collections
-                if create_vrt and collection in self.raster_collections:
+                if create_vrt and collection in self.dataset.raster_collections:
                     feedback.pushInfo(f"Creating VRT for {collection}...")
-                    vrt_path = self.create_vrt_for_collection(collection, output_folder, feedback)
-
-                    if vrt_path:
+                    for vrt_path in self.create_vrts_for_collection(collection, output_folder, context, feedback):
                         vrt_files.append((vrt_path, collection))
 
                         # Build overviews if requested
                         if build_overviews:
-                            self.build_vrt_overviews(vrt_path, feedback)
+                            self.build_vrt_overviews(vrt_path, context, feedback)
 
                         # Load VRT to QGIS if requested
                         if load_vrt:
-                            self.load_vrt_to_qgis(vrt_path, collection, feedback)
+                            vrt_name = os.path.splitext(os.path.basename(vrt_path))[0]
+                            self.load_layer_on_completion(vrt_path, f"DGT_{vrt_name}", context)
 
             # Create boundary layer if requested
             boundary_layer_path = None
-            if create_boundary and boundary_output:
+            if create_boundary:
                 feedback.pushInfo("Creating boundary layer...")
+                os.makedirs(output_folder, exist_ok=True)
+                boundary_output = os.path.join(output_folder, BOUNDARY_FILENAME)
 
-                if input_method == 0:  # Extent method
-                    boundary_layer_path = self.create_boundary_layer_bbox(
-                        small_bboxes, boundary_output, context, feedback
-                    )
-                else:  # Polygon method
+                if use_polygon:
                     boundary_layer_path = self.create_boundary_layer_polygon(
                         small_polygons, boundary_output, context, feedback
                     )
+                else:
+                    boundary_layer_path = self.create_boundary_layer_bbox(
+                        small_bboxes, boundary_output, context, feedback
+                    )
 
                 if boundary_layer_path:
-                    # Load boundary layer to QGIS
-                    boundary_layer = QgsVectorLayer(boundary_layer_path, "DGT Download Boundaries", "ogr")
-                    if boundary_layer.isValid():
-                        QgsProject.instance().addMapLayer(boundary_layer)
-                        feedback.pushInfo("Boundary layer added to QGIS")
+                    self.load_layer_on_completion(boundary_layer_path, "DGT Download Boundaries", context)
 
             # Summary
             feedback.pushInfo("Download process completed!")
-            feedback.pushInfo(f"Total files downloaded: {downloaded_files}")
+            feedback.pushInfo(f"Files downloaded: {download_results[DOWNLOADED]}")
+            feedback.pushInfo(f"Files skipped (already present): {download_results[SKIPPED]}")
+            if download_results[FAILED]:
+                feedback.reportError(f"Files failed: {download_results[FAILED]}")
             feedback.pushInfo(f"Collections processed: {len(all_urls_per_collection)}")
 
             if vrt_files:
@@ -1327,7 +1601,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             # Return results
             results = {
                 'OUTPUT_FOLDER': output_folder,
-                'DOWNLOADED_FILES': downloaded_files,
+                'DOWNLOADED_FILES': download_results[DOWNLOADED],
                 'COLLECTIONS': list(all_urls_per_collection.keys())
             }
 

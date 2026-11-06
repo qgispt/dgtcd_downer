@@ -3,12 +3,12 @@ from qgis.PyQt.QtGui import QIcon
 import os
 
 # Import the algorithm
-from .processing_algorithm import DgtCddDownloaderAlgorithm
+from .processing_algorithm import AUTH_MODES, DATASETS, DgtCddDownloaderAlgorithm
 
 
 class DgtCddDownloaderProvider(QgsProcessingProvider):
     """
-    This class registers the DGT CDD Downloader algorithm with the Processing framework.
+    This class registers the DGT CDD Downloader algorithms with the Processing framework.
     """
 
     def __init__(self):
@@ -18,10 +18,11 @@ class DgtCddDownloaderProvider(QgsProcessingProvider):
         """
         Loads all algorithms belonging to this provider.
         """
-        # Instantiate the algorithm and add it directly.
-        # The parent class handles storing it.
-        alg = DgtCddDownloaderAlgorithm()
-        self.addAlgorithm(alg)
+        # One toolbox entry per dataset and authentication mode.
+        # The parent class handles storing them.
+        for dataset in DATASETS:
+            for auth_mode in AUTH_MODES:
+                self.addAlgorithm(DgtCddDownloaderAlgorithm(dataset, auth_mode))
 
     def id(self, *args, **kwargs):
         """
