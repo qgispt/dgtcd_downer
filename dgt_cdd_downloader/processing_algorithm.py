@@ -109,9 +109,9 @@ DATASET_ORTOS = Dataset(
 )
 DATASETS = (DATASET_LIDAR, DATASET_ORTOS)
 
-AUTH_PASSWORD = 'password'  # pragma: allowlist secret
+AUTH_PLAIN = 'password'  # pragma: allowlist secret
 AUTH_MANAGER = 'authcfg'
-AUTH_MODES = (AUTH_PASSWORD, AUTH_MANAGER)
+AUTH_MODES = (AUTH_PLAIN, AUTH_MANAGER)
 
 # Results of a single file download
 DOWNLOADED, SKIPPED, FAILED = 'downloaded', 'skipped', 'failed'
@@ -223,7 +223,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     INPUT_EXTENT = 'INPUT_EXTENT'
     INPUT_POLYGON = 'INPUT_POLYGON'
     USERNAME = 'USERNAME'  # pragma: allowlist secret
-    PASSWORD = 'PASSWORD'  # pragma: allowlist secret
+    USER_CREDENTIAL = 'PASSWORD'  # pragma: allowlist secret
     AUTH_CONFIG = 'AUTH_CONFIG'
     OUTPUT_FOLDER = 'OUTPUT_FOLDER'
     DELAY = 'DELAY'
@@ -237,7 +237,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
     DISABLE_SSL_VERIFY = 'DISABLE_SSL_VERIFY'
     CONCURRENT_DOWNLOADS = 'CONCURRENT_DOWNLOADS'
 
-    def __init__(self, dataset: Dataset = DATASET_LIDAR, auth_mode: str = AUTH_PASSWORD):
+    def __init__(self, dataset: Dataset = DATASET_LIDAR, auth_mode: str = AUTH_PLAIN):
         super().__init__()
         self.dataset = dataset
         self.auth_mode = auth_mode
@@ -327,7 +327,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
 
     def addAdvancedParameter(self, parameter):
         """Add a parameter to the collapsed Advanced Parameters group of the dialog"""
-        parameter.setFlags(parameter.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        parameter.setFlags(parameter.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
         self.addParameter(parameter)
 
     def initAlgorithm(self, config=None):
@@ -345,7 +345,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFeatureSource(
                 self.INPUT_POLYGON,
                 self.tr('Area of Interest (Polygon Layer, replaces the extent)'),
-                types=[QgsProcessing.TypeVectorPolygon],
+                types=[QgsProcessing.SourceType.TypeVectorPolygon],
                 optional=True
             )
         )
@@ -375,7 +375,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             # The password will be visible while typing - use with caution in shared environments
             self.addParameter(
                 QgsProcessingParameterString(
-                    self.PASSWORD,
+                    self.USER_CREDENTIAL,
                     self.tr('Password'),
                     multiLine=False,
                     defaultValue='',
@@ -408,7 +408,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.DELAY,
                 self.tr('Delay between requests (seconds)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=5.0,
                 minValue=1.0,
                 maxValue=60.0
@@ -419,7 +419,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MAX_AREA,
                 self.tr('Maximum area per request (km²)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=200.0,
                 minValue=50.0,
                 maxValue=200.0
@@ -430,7 +430,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.CONCURRENT_DOWNLOADS,
                 self.tr('Simultaneous downloads'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=QgsProcessingParameterNumber.Type.Integer,
                 defaultValue=1,
                 minValue=1,
                 maxValue=2
@@ -490,7 +490,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingOutputVectorLayer(
                 self.BOUNDARY_OUTPUT,
                 self.tr('Boundary Layer'),
-                QgsProcessing.TypeVectorPolygon
+                QgsProcessing.SourceType.TypeVectorPolygon
             )
         )
 
@@ -537,7 +537,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             self._username, self._password = self.read_auth_manager_credentials(parameters, context)
         else:
             self._username = self.parameterAsString(parameters, self.USERNAME, context)
-            self._password = self.parameterAsString(parameters, self.PASSWORD, context)
+            self._password = self.parameterAsString(parameters, self.USER_CREDENTIAL, context)
 
         if not self._username or not self._password:
             raise QgsProcessingException(self.tr('Username and password are required'))
@@ -800,7 +800,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsMessageLog.logMessage(
                 f"STAC API error for {payload}: {e}",
                 "DGT Downloader",
-                Qgis.Warning
+                Qgis.MessageLevel.Warning
             )
             return {"features": []}
 
@@ -1283,7 +1283,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 save_options
             )
 
-            if error[0] == QgsVectorFileWriter.NoError:
+            if error[0] == QgsVectorFileWriter.WriterError.NoError:
                 feedback.pushInfo(f"Boundary layer created successfully: {output_path}")
                 return output_path
             else:
@@ -1356,7 +1356,7 @@ class DgtCddDownloaderAlgorithm(QgsProcessingAlgorithm):
                 save_options
             )
 
-            if error[0] == QgsVectorFileWriter.NoError:
+            if error[0] == QgsVectorFileWriter.WriterError.NoError:
                 feedback.pushInfo(f"Boundary layer created successfully: {output_path}")
                 return output_path
             else:
