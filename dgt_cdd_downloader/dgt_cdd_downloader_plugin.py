@@ -24,6 +24,13 @@ class DgtCddDownloaderPlugin:
         self.iface = iface
         self.provider = None
 
+    def initProcessing(self):
+        """
+        Registers the provider. Called directly by qgis_process, which has no GUI.
+        """
+        self.provider = DgtCddDownloaderProvider()
+        QgsApplication.processingRegistry().addProvider(self.provider)
+
     def initGui(self):
         """
         Called when the plugin is loaded in QGIS.
@@ -43,8 +50,7 @@ class DgtCddDownloaderPlugin:
             )
             return
 
-        self.provider = DgtCddDownloaderProvider()
-        QgsApplication.processingRegistry().addProvider(self.provider)
+        self.initProcessing()
 
     def unload(self):
         """
