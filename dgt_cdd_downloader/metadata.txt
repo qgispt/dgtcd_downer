@@ -16,7 +16,7 @@ about= <div style="max-width:33em">A plugin for the <a href="https://cdd.dgterri
 
         Tool developed by the community and not affiliated with Direção-Geral do Território!</li></ul></div>
 
-version=0.3.0
+version=0.3.1
 qgisMinimumVersion=3.24
 qgisMaximumVersion=4.99
 supportsQt6=True
@@ -31,6 +31,9 @@ icon=icon.png
 experimental=false
 deprecated=false
 changelog=
+    0.3.1
+    Qt6 compatibility check fixes, with no change in behaviour or QGIS 3 support
+    Security scan fixes: renamed internal constants that were flagged as hardcoded passwords
     0.3.0
     Four toolbox entries: LiDAR and ORTOS, each with password or QGIS auth manager login
     ORTOS collections 1995-2025, thanks to the contribution of Sergio Pinheiro (https://github.com/sergiuspinheiro)
